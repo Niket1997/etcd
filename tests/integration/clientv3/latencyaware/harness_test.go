@@ -229,8 +229,10 @@ func (c *cluster) client(t *testing.T, cfg *clientv3.LatencyAwareConfig, eps ...
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:    eps,
 		LatencyAware: cfg,
-		Logger:       zap.New(zapcore.NewTee(core, zaptest.NewLogger(t).Core())),
-		DialOptions:  []grpc.DialOption{grpc.WithStatsHandler(m)},
+		// Info: clientv3 logs every attempt at Debug, a test-output write
+		// per call that stalls the callers at thousands of calls a second.
+		Logger:      zap.New(zapcore.NewTee(core, zaptest.NewLogger(t, zaptest.Level(zap.InfoLevel)).Core())),
+		DialOptions: []grpc.DialOption{grpc.WithStatsHandler(m)},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { cli.Close() })

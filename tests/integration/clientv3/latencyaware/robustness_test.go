@@ -32,11 +32,19 @@ import (
 
 // Contention, throughput and lifecycle: what a policy on the hot path must not cost.
 
+// code is err's gRPC code. clientv3 returns a caller's expired context as is.
+func code(err error) codes.Code {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return codes.DeadlineExceeded
+	}
+	return status.Code(err)
+}
+
 // deadlines counts the results that ended at their deadline.
 func deadlines(rs results) int {
 	n := 0
 	for _, r := range rs {
-		if errors.Is(r.err, context.DeadlineExceeded) || status.Code(r.err) == codes.DeadlineExceeded {
+		if code(r.err) == codes.DeadlineExceeded {
 			n++
 		}
 	}

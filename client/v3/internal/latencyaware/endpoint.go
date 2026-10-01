@@ -39,6 +39,7 @@ const strikesToCount = 3
 // sample count with the previous average, which no verdict depends on.
 type endpoint struct {
 	addr string
+	lbl  labels
 
 	n    atomic.Int64 // samples so far
 	avg  atomic.Int64 // ns: running mean while warming up, then the EMA

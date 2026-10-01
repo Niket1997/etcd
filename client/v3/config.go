@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 
 	"go.etcd.io/etcd/client/pkg/v3/transport"
+	"go.etcd.io/etcd/client/v3/internal/latencyaware"
 )
 
 type Config struct {
@@ -109,8 +110,23 @@ type Config struct {
 	// BackoffJitterFraction is the jitter fraction to randomize backoff wait time.
 	BackoffJitterFraction float64 `json:"backoff-jitter-fraction"`
 
-	// TODO: support custom balancer picker
+	// LatencyAware, if set, balances with the latency-aware policy: round robin
+	// that stops sending to members much slower than the fastest one, never
+	// more than MaxUnhealthyEndpoints of them. nil keeps plain round robin.
+	// Client.SetLatencyAwareConfig changes it at runtime. The policy comes in
+	// the resolver's service config, so grpc.WithDisableServiceConfig turns it off.
+	LatencyAware *LatencyAwareConfig `json:"latency-aware"`
 }
+
+// LatencyAwareConfig tunes the latency-aware policy. Zero fields take the defaults.
+type LatencyAwareConfig = latencyaware.Config
+
+// Latency-aware modes.
+const (
+	LatencyAwareEnabled = latencyaware.ModeEnabled // the default
+	LatencyAwareShadow  = latencyaware.ModeShadow
+	LatencyAwareOff     = latencyaware.ModeOff
+)
 
 // ConfigSpec is the configuration from users, which comes from command-line flags,
 // environment variables or config file. It is a fully declarative configuration,

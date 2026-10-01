@@ -15,6 +15,7 @@
 package resolver
 
 import (
+	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/serviceconfig"
@@ -31,17 +32,25 @@ const (
 type EtcdManualResolver struct {
 	*manual.Resolver
 	endpoints     []string
+	policy        string                 // service config selecting the balancing policy
+	attrs         *attributes.Attributes // for the policy, sent in every update
 	serviceConfig *serviceconfig.ParseResult
 }
 
 func New(endpoints ...string) *EtcdManualResolver {
+	return NewWithPolicy(`{"loadBalancingPolicy": "round_robin"}`, nil, endpoints...)
+}
+
+// NewWithPolicy is New with the service config that selects the balancing
+// policy, and attributes the policy reads from every update.
+func NewWithPolicy(serviceConfig string, attrs *attributes.Attributes, endpoints ...string) *EtcdManualResolver {
 	r := manual.NewBuilderWithScheme(Schema)
-	return &EtcdManualResolver{Resolver: r, endpoints: endpoints, serviceConfig: nil}
+	return &EtcdManualResolver{Resolver: r, endpoints: endpoints, policy: serviceConfig, attrs: attrs}
 }
 
 // Build returns itself for Resolver, because it's both a builder and a resolver.
 func (r *EtcdManualResolver) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
-	r.serviceConfig = cc.ParseServiceConfig(`{"loadBalancingPolicy": "round_robin"}`)
+	r.serviceConfig = cc.ParseServiceConfig(r.policy)
 	if r.serviceConfig.Err != nil {
 		return nil, r.serviceConfig.Err
 	}
@@ -60,8 +69,8 @@ func (r EtcdManualResolver) updateState() {
 	}
 }
 
-// state builds the resolver state (endpoints + ServiceConfig) from the
-// endpoints currently stored in r.
+// state builds the resolver state (endpoints + ServiceConfig + attributes)
+// from the endpoints currently stored in r.
 func (r EtcdManualResolver) state() resolver.State {
 	eps := make([]resolver.Endpoint, len(r.endpoints))
 	for i, ep := range r.endpoints {
@@ -73,6 +82,7 @@ func (r EtcdManualResolver) state() resolver.State {
 	return resolver.State{
 		Endpoints:     eps,
 		ServiceConfig: r.serviceConfig,
+		Attributes:    r.attrs,
 	}
 }
 

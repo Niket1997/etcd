@@ -20,6 +20,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 )
@@ -272,4 +273,24 @@ func TestState(t *testing.T) {
 		addr("unix:///tmp/etcd.sock", "etcd.sock"),
 	)
 	assert.Equal(t, want, r.state())
+}
+
+func TestNewWithPolicySendsItsServiceConfigAndAttributesInEveryUpdate(t *testing.T) {
+	sc := &serviceconfig.ParseResult{}
+	cc := &fakeClientConn{parsed: sc}
+	attrs := attributes.New("key", "value")
+	r := NewWithPolicy(`{"loadBalancingConfig":[{"some_policy":{}}]}`, attrs, "127.0.0.1:2379")
+
+	_, err := r.Build(resolver.Target{}, cc, resolver.BuildOptions{})
+	require.NoError(t, err)
+	r.SetEndpoints([]string{"127.0.0.1:3379"})
+
+	assert.JSONEq(t, `{"loadBalancingConfig":[{"some_policy":{}}]}`, cc.lastParsedArg)
+	ep := func(a string) []resolver.Endpoint {
+		return []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: a, ServerName: a}}}}
+	}
+	assert.Equal(t, []resolver.State{
+		{Endpoints: ep("127.0.0.1:2379"), ServiceConfig: sc, Attributes: attrs},
+		{Endpoints: ep("127.0.0.1:3379"), ServiceConfig: sc, Attributes: attrs},
+	}, cc.states)
 }

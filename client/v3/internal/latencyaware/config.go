@@ -53,7 +53,7 @@ type Config struct {
 	// between healthy members is not a gap. Default 10ms.
 	MinLatencyFloor time.Duration `json:"min-latency-floor,omitempty"`
 	// EMAScale is the time constant of a member's latency average: larger is
-	// steadier but slower to recover. Default 100ms.
+	// steadier but slower to recover. Default 1s.
 	EMAScale time.Duration `json:"ema-scale,omitempty"`
 	// RetryPeriod spaces a refused member's probes and is the failure-strike
 	// window. Default 30s.
@@ -78,7 +78,7 @@ func (c Config) withDefaults() (Config, error) {
 	orDefault(&c.Mode, ModeEnabled)
 	orDefault(&c.ExclusionThreshold, 2)
 	orDefault(&c.MinLatencyFloor, 10*time.Millisecond)
-	orDefault(&c.EMAScale, 100*time.Millisecond)
+	orDefault(&c.EMAScale, time.Second)
 	orDefault(&c.RetryPeriod, 30*time.Second)
 	orDefault(&c.WarmupSamples, 50)
 	orDefault(&c.MaxUnhealthyEndpoints, 1)

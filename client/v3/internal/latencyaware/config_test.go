@@ -32,7 +32,7 @@ func TestZeroConfigTakesTheDefaults(t *testing.T) {
 		Mode:                  ModeEnabled,
 		ExclusionThreshold:    2,
 		MinLatencyFloor:       10 * time.Millisecond,
-		EMAScale:              100 * time.Millisecond,
+		EMAScale:              time.Second,
 		RetryPeriod:           30 * time.Second,
 		WarmupSamples:         50,
 		MaxUnhealthyEndpoints: 1,

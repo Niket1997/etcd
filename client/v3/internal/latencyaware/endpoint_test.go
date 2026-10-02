@@ -37,11 +37,12 @@ func newFakeClock() *fakeClock {
 func (c *fakeClock) now() int64              { return c.t.Load() }
 func (c *fakeClock) advance(d time.Duration) { c.t.Add(int64(d)) }
 
-// testConfig is the default config with a small warm-up and an hour-long
-// retry period, so nothing expires unless a test moves the clock that far.
+// testConfig is the default config with a 100 ms EMA
+// scale, a small warm-up and an hour-long retry period, so nothing expires
+// unless a test moves the clock that far.
 func testConfig(t *testing.T) *Config {
 	t.Helper()
-	c, err := Config{WarmupSamples: 3, RetryPeriod: time.Hour, MinLatencyFloor: time.Millisecond}.withDefaults()
+	c, err := Config{EMAScale: 100 * time.Millisecond, WarmupSamples: 3, RetryPeriod: time.Hour, MinLatencyFloor: time.Millisecond}.withDefaults()
 	require.NoError(t, err)
 	return &c
 }

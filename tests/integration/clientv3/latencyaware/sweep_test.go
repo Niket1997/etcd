@@ -24,10 +24,11 @@ import (
 )
 
 // TestSweepDefaults measures candidate defaults on the faults that pull them
-// apart, in real time: short stalls on a healthy member (a jumpy average
-// refuses it for a retry period each time), the reference fault and its heal
-// (detection, loss, recovery), and a uniformly slower member (sensitivity).
-// It reports and asserts nothing; ETCD_LA_SWEEP=1 runs it, in about half an hour.
+// apart, in real time: 200 ms and 1 s stalls on a healthy member (a jumpy
+// average refuses it for a retry period each time), the reference fault and its
+// heal (detection, loss, recovery), and a uniformly slower member
+// (sensitivity). It reports and asserts nothing; ETCD_LA_SWEEP=1 runs it, in
+// about forty minutes.
 func TestSweepDefaults(t *testing.T) {
 	if os.Getenv("ETCD_LA_SWEEP") == "" {
 		t.Skip("ETCD_LA_SWEEP=1 runs the defaults sweep")
@@ -39,8 +40,8 @@ func TestSweepDefaults(t *testing.T) {
 		name string
 		cfg  clientv3.LatencyAwareConfig
 	}{
-		{"defaults (EMA 100ms)", clientv3.LatencyAwareConfig{}},
-		{"EMA 1s", clientv3.LatencyAwareConfig{EMAScale: time.Second}},
+		{"defaults (EMA 1s)", clientv3.LatencyAwareConfig{}},
+		{"EMA 100ms", clientv3.LatencyAwareConfig{EMAScale: 100 * time.Millisecond}},
 		{"EMA 10s", clientv3.LatencyAwareConfig{EMAScale: 10 * time.Second}},
 		{"EMA 10s, retry 10s", clientv3.LatencyAwareConfig{EMAScale: 10 * time.Second, RetryPeriod: 10 * time.Second}},
 		{"reference (3 x 50ms, EMA 10s)", clientv3.LatencyAwareConfig{ExclusionThreshold: 3, MinLatencyFloor: 50 * time.Millisecond, EMAScale: 10 * time.Second}},
@@ -53,15 +54,28 @@ func TestSweepDefaults(t *testing.T) {
 			done <- run(ctx, loadConfig{rate: 1000, maxInFlight: 1000, timeout: time.Second, req: get(cli)})
 		}()
 		time.Sleep(10 * time.Second)
-
-		// Six 200 ms stalls of 300 ms on member a, ten seconds apart.
-		stalls := time.Now()
-		for range 6 {
-			c.Slow(a, 300*time.Millisecond, 0)
-			time.Sleep(200 * time.Millisecond)
-			c.Heal(a)
-			time.Sleep(9800 * time.Millisecond)
+		// admitted waits, up to six retry periods, until member m is let back in.
+		admitted := func(m int) {
+			for from := time.Now(); time.Since(from) < 6*30*time.Second && !refusedAt(cli, c, m, time.Now()).IsZero(); {
+				time.Sleep(time.Second)
+			}
 		}
+
+		// Six stalls of 300 ms on member a, ten seconds apart: 200 ms ones, then
+		// 1 s ones. Each phase ends once a is back.
+		stalls := func(d time.Duration) {
+			for range 6 {
+				c.Slow(a, 300*time.Millisecond, 0)
+				time.Sleep(d)
+				c.Heal(a)
+				time.Sleep(10*time.Second - d)
+			}
+			admitted(a)
+		}
+		short := time.Now()
+		stalls(200 * time.Millisecond)
+		long := time.Now()
+		stalls(time.Second)
 
 		// The reference fault on member b for a minute, then its heal.
 		fault := time.Now()
@@ -69,9 +83,7 @@ func TestSweepDefaults(t *testing.T) {
 		time.Sleep(time.Minute)
 		heal := time.Now()
 		c.Heal(b)
-		for time.Since(heal) < 6*30*time.Second && !refusedAt(cli, c, b, time.Now()).IsZero() {
-			time.Sleep(time.Second)
-		}
+		admitted(b)
 
 		// Every call on member b 50 ms slower, for a minute.
 		uniform := time.Now()
@@ -83,11 +95,12 @@ func TestSweepDefaults(t *testing.T) {
 		rs := <-done
 		cli.Close()
 
-		stallOut, stallEpisodes := outOfRotation(cli, c, a, stalls, fault)
+		shortOut, shortEpisodes := outOfRotation(cli, c, a, short, long)
+		longOut, longEpisodes := outOfRotation(cli, c, a, long, fault)
 		faultOut, faultEpisodes := outOfRotation(cli, c, b, fault, heal)
 		_, uniformEpisodes := outOfRotation(cli, c, b, uniform, end)
-		t.Logf("%-28s stalls: refused %d times, out %v | fault: refused after %v, %d of %d failed, refused %d times, out %v of 1m | heal: back after %v | +50ms: refused %d times after %v",
-			tc.name, stallEpisodes, stallOut.Round(100*time.Millisecond),
+		t.Logf("%-28s 200ms stalls: refused %d times, out %v | 1s stalls: refused %d times, out %v | fault: refused after %v, %d of %d failed, refused %d times, out %v of 1m | heal: back after %v | +50ms: refused %d times after %v",
+			tc.name, shortEpisodes, shortOut.Round(100*time.Millisecond), longEpisodes, longOut.Round(100*time.Millisecond),
 			since(when(cli, refusedMsg, c.addr(b), fault), fault), rs.window(fault, heal).failed(), len(rs.window(fault, heal)), faultEpisodes, faultOut.Round(100*time.Millisecond),
 			since(when(cli, readmittedMsg, c.addr(b), heal), heal),
 			uniformEpisodes, since(when(cli, refusedMsg, c.addr(b), uniform), uniform))

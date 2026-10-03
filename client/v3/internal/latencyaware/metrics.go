@@ -127,6 +127,40 @@ func (b *lb) recordScan(view []*endpoint, c *Config, ref int64) {
 
 func (b *lb) lg() *zap.Logger { return b.shared.Load().lg }
 
+// maxQueuedLogs bounds the transition lines waiting on a stuck log sink.
+const maxQueuedLogs = 100
+
+// emit queues a transition log line. Pick must not block, and a log sink can,
+// so a goroutine writes the queue in order and exits once it's empty; a line
+// past maxQueuedLogs is dropped.
+func (b *lb) emit(line func()) {
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
+	if len(b.logQ) >= maxQueuedLogs {
+		return
+	}
+	b.logQ = append(b.logQ, line)
+	if !b.logging {
+		b.logging = true
+		go b.writeLogs()
+	}
+}
+
+func (b *lb) writeLogs() {
+	for {
+		b.logMu.Lock()
+		lines := b.logQ
+		b.logQ, b.logging = nil, len(lines) > 0
+		b.logMu.Unlock()
+		if len(lines) == 0 {
+			return
+		}
+		for _, line := range lines {
+			line()
+		}
+	}
+}
+
 // noteVerdict logs a member's verdict when it changes.
 func (b *lb) noteVerdict(e *endpoint, refused bool, c *Config, ref int64) {
 	if e.refused.Load() == refused || !e.refused.CompareAndSwap(!refused, refused) {
@@ -136,13 +170,14 @@ func (b *lb) noteVerdict(e *endpoint, refused bool, c *Config, ref int64) {
 	if refused {
 		msg = "latency-aware: member refused"
 	}
-	b.lg().Info(msg,
+	lg, fields := b.lg(), []zap.Field{
 		zap.String("endpoint", e.addr),
 		zap.String("mode", c.Mode),
 		zap.Duration("avg", time.Duration(e.avg.Load())),
 		zap.Duration("cluster-min", time.Duration(ref)),
 		zap.Duration("line", time.Duration(c.ExclusionThreshold*float64(ref))),
-	)
+	}
+	b.emit(func() { lg.Info(msg, fields...) })
 }
 
 // noteFallback logs the quorum fallback starting and ending. Its cause is
@@ -151,8 +186,9 @@ func (b *lb) noteFallback(on bool, c *Config, refused, missing, ready, total int
 	if b.fallback.Load() == on || !b.fallback.CompareAndSwap(!on, on) {
 		return
 	}
+	lg, mode := b.lg(), zap.String("mode", c.Mode)
 	if !on {
-		b.lg().Info("latency-aware: quorum fallback ended", zap.String("mode", c.Mode))
+		b.emit(func() { lg.Info("latency-aware: quorum fallback ended", mode) })
 		return
 	}
 	cause, level := "missing", zapcore.WarnLevel
@@ -162,13 +198,16 @@ func (b *lb) noteFallback(on bool, c *Config, refused, missing, ready, total int
 	if c.Mode == ModeShadow {
 		level = zapcore.InfoLevel // nothing was being enforced, so routing is unchanged
 	}
-	b.lg().Log(level, "latency-aware: too many members unhealthy, routing plain round robin",
-		zap.String("mode", c.Mode),
+	fields := []zap.Field{
+		mode,
 		zap.String("cause", cause),
 		zap.Int("refused", refused),
 		zap.Int("missing", missing),
 		zap.Int("ready", ready),
 		zap.Int("total", total),
 		zap.Int("max-unhealthy", c.MaxUnhealthyEndpoints),
-	)
+	}
+	b.emit(func() {
+		lg.Log(level, "latency-aware: too many members unhealthy, routing plain round robin", fields...)
+	})
 }

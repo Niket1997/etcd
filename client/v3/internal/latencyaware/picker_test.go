@@ -16,11 +16,13 @@ package latencyaware
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
@@ -142,14 +144,14 @@ func TestTheQuorumGuard(t *testing.T) {
 
 		assert.Equalf(t, map[string]int{"a": 50, "c": 50}, pickAll(t, p, 100, kvRange), "plain round robin")
 		assert.EqualValues(t, 50, h.rec.count(picksName, h.b.target, "c", "quorum"))
-		started := h.logs.FilterMessage(fallbackStarted).All()
+		started := h.logged().FilterMessage(fallbackStarted).All()
 		require.Lenf(t, started, 1, "logged when it starts, not per pick")
 		assert.Equal(t, zapcore.WarnLevel, started[0].Level)
 		assert.Equal(t, "missing", started[0].ContextMap()["cause"])
 
 		h.warm(p.ready[1].ep, ms, 0)
 		assert.Equal(t, map[string]int{"a": 5, "c": 5}, pickAll(t, p, 10, kvRange))
-		assert.Equal(t, 1, h.logs.FilterMessage(fallbackEnded).Len())
+		assert.Equal(t, 1, h.logged().FilterMessage(fallbackEnded).Len())
 	})
 	t.Run("refused members alone tip it", func(t *testing.T) {
 		h := newHarness(t, pickerConfig())
@@ -157,7 +159,7 @@ func TestTheQuorumGuard(t *testing.T) {
 		h.judge(p, ms, 50*ms, 50*ms)
 
 		assert.Equal(t, map[string]int{"a": 10, "b": 10, "c": 10}, pickAll(t, p, 30, kvRange))
-		assert.Equal(t, "unhealthy", h.logs.FilterMessage(fallbackStarted).All()[0].ContextMap()["cause"])
+		assert.Equal(t, "unhealthy", h.logged().FilterMessage(fallbackStarted).All()[0].ContextMap()["cause"])
 	})
 	t.Run("shadow logs it at info", func(t *testing.T) {
 		cfg := pickerConfig()
@@ -167,7 +169,7 @@ func TestTheQuorumGuard(t *testing.T) {
 		h.judge(p, ms, 50*ms)
 
 		pickAll(t, p, 10, kvRange)
-		assert.Equal(t, zapcore.InfoLevel, h.logs.FilterMessage(fallbackStarted).All()[0].Level)
+		assert.Equal(t, zapcore.InfoLevel, h.logged().FilterMessage(fallbackStarted).All()[0].Level)
 	})
 	t.Run("nothing refused means nothing to guard", func(t *testing.T) {
 		h := newHarness(t, pickerConfig())
@@ -175,7 +177,7 @@ func TestTheQuorumGuard(t *testing.T) {
 		h.judge(p, ms)
 
 		assert.Equal(t, map[string]int{"a": 10}, pickAll(t, p, 10, kvRange))
-		assert.Zero(t, h.logs.FilterMessage(fallbackStarted).Len())
+		assert.Zero(t, h.logged().FilterMessage(fallbackStarted).Len())
 	})
 }
 
@@ -185,13 +187,13 @@ func TestVerdictChangesAreLoggedOnce(t *testing.T) {
 	h.judge(p, ms, 50*ms)
 
 	pickAll(t, p, 20, kvRange)
-	refused := h.logs.FilterMessage("latency-aware: member refused").All()
+	refused := h.logged().FilterMessage("latency-aware: member refused").All()
 	require.Len(t, refused, 1)
 	assert.Equal(t, "c", refused[0].ContextMap()["endpoint"])
 
 	h.warm(p.ready[1].ep, ms, 0)
 	pickAll(t, p, 20, kvRange)
-	assert.Equal(t, 1, h.logs.FilterMessage("latency-aware: member readmitted").Len())
+	assert.Equal(t, 1, h.logged().FilterMessage("latency-aware: member readmitted").Len())
 }
 
 func TestAModeChangeAppliesOnTheNextPick(t *testing.T) {
@@ -351,4 +353,74 @@ func TestEveryEtcdRPCIsClassified(t *testing.T) {
 		}
 	}
 	assert.Falsef(t, timed("/v3lockpb.Lock/Lock"), "other services on the connection are never timed")
+}
+
+func TestAStuckLogSinkNeverBlocksAPick(t *testing.T) {
+	h := newHarness(t, pickerConfig())
+	sink := &stuckSink{release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(sink.release) })
+	defer release()
+	core := zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), zapcore.AddSync(sink), zap.InfoLevel)
+	sh, err := NewShared(pickerConfig(), zap.New(core))
+	require.NoError(t, err)
+	h.b.shared.Store(sh)
+	p := h.picker(2, "a", "c")
+	h.judge(p, ms, 50*ms)
+
+	picked := make(chan struct{})
+	go func() {
+		defer close(picked)
+		info := balancer.PickInfo{FullMethodName: kvRange}
+		_, _ = p.Pick(info) // c refused: the writer takes the line and sticks
+		for !sink.entered.Load() {
+			time.Sleep(time.Millisecond)
+		}
+		for i := range 3 * maxQueuedLogs { // each pick flips c's verdict: a line each
+			h.warm(p.ready[1].ep, []time.Duration{ms, 50 * ms}[i%2], 0)
+			_, _ = p.Pick(info)
+		}
+	}()
+	select {
+	case <-picked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a pick waited for the log sink")
+	}
+	release()
+	h.logged()
+	assert.EqualValuesf(t, 1+maxQueuedLogs, sink.lines.Load(), "the stuck line, then the queue; the rest dropped")
+}
+
+func TestANewFloorAppliesOnTheNextPick(t *testing.T) {
+	h := newHarness(t, pickerConfig())
+	p := h.picker(2, "a", "c")
+	h.judge(p, ms, 50*ms)
+	require.Equal(t, map[string]int{"a": 10}, pickAll(t, p, 10, kvRange))
+
+	cfg := pickerConfig()
+	cfg.MinLatencyFloor = 100 * ms
+	require.NoError(t, h.sh.Set(cfg))
+	assert.Equalf(t, map[string]int{"a": 5, "c": 5}, pickAll(t, p, 10, kvRange), "50ms is under twice the new floor, with no rescan")
+}
+
+func TestAProbeThatSentNothingIsHandedBack(t *testing.T) {
+	h := newHarness(t, pickerConfig())
+	p := h.picker(2, "a", "c")
+	h.judge(p, ms, 50*ms)
+	h.warm(p.ready[1].ep, 50*ms, 2*time.Hour) // c's probe is due
+	child := p.ready[1].picker.(*fakeChildPicker)
+
+	child.err = balancer.ErrNoSubConnAvailable
+	_, err := p.Pick(balancer.PickInfo{FullMethodName: kvRange})
+	require.ErrorIs(t, err, balancer.ErrNoSubConnAvailable)
+	child.err = nil
+	res, got := pick(t, p, kvRange)
+	require.Equalf(t, "c", got, "the child's error handed the probe back")
+
+	res.Done(balancer.DoneInfo{})
+	res, got = pick(t, p, kvRange)
+	require.Equalf(t, "c", got, "so did gRPC abandoning the pick")
+
+	res.Done(balancer.DoneInfo{Err: status.Error(codes.Unavailable, "gone")})
+	_, got = pick(t, p, kvRange)
+	assert.Equalf(t, "a", got, "a probe that went out keeps its lease")
 }

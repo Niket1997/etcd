@@ -107,8 +107,9 @@ func orDefault[T comparable](v *T, def T) {
 	}
 }
 
-// Shared is one client's live config and logger, handed to its balancer in
-// the resolver attributes. Set swaps the config; the next pick uses it.
+// Shared is one client's live config and logger. The resolver attributes carry
+// a fixed pointer to it; Set swaps the config behind it, and decisions use the
+// new one from the next pick while learned state carries over.
 type Shared struct {
 	cfg atomic.Pointer[Config]
 	lg  *zap.Logger

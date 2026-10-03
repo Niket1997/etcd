@@ -54,10 +54,14 @@ type lb struct {
 	eps *resolver.EndpointMap[*endpoint]
 
 	view     atomic.Pointer[[]*endpoint] // every member, for the cluster-minimum scan
-	min      atomic.Int64                // cluster minimum, floor-clamped; 0 until a member qualifies
-	nextScan atomic.Int64
+	min      atomic.Int64                // cluster minimum before the floor; 0 until a member qualifies
+	lastScan atomic.Int64                // clock time of the last scan that set min, 0 for none
 	scanMu   sync.Mutex
 	fallback atomic.Bool // quorum fallback active, so only changes are logged
+
+	logMu   sync.Mutex
+	logQ    []func() // transition log lines waiting to be written
+	logging bool     // a goroutine is writing logQ
 }
 
 // newBalancer is Build with the child policy and clock injectable for tests.
@@ -117,7 +121,7 @@ func (b *lb) UpdateState(state balancer.State) {
 			if !e.down {
 				e.down = true // off tracks the episode too, so a flip mid-outage can't count it
 				if c.Mode != ModeOff {
-					e.transportFailure(b.now, c, b.min.Load())
+					e.transportFailure(b.now, c, b.ref(c))
 				}
 			}
 		}
@@ -168,7 +172,7 @@ func (b *lb) finish(e *endpoint, err error, start int64, timed, probe bool) {
 	case err == nil:
 		e.success(b.now, start, c)
 	case trippable(err):
-		e.failure(b.now, c, b.min.Load(), probe)
+		e.failure(b.now, c, b.ref(c), probe)
 	default:
 		return
 	}
@@ -176,12 +180,12 @@ func (b *lb) finish(e *endpoint, err error, start int64, timed, probe bool) {
 }
 
 // rescan recomputes the cluster minimum: the fastest warmed-up member with a
-// sample in the last RetryPeriod, floor-clamped. Unless forced it runs at most
-// every RescanInterval; nothing qualifying keeps the last value and lets the
-// next sample try again.
+// sample in the last RetryPeriod. Unless forced it runs at most every
+// RescanInterval; nothing qualifying keeps the last value and lets the next
+// sample try again.
 func (b *lb) rescan(force bool) {
-	t := b.now()
-	if !force && t < b.nextScan.Load() {
+	t, c := b.now(), b.shared.Load().config()
+	if last := b.lastScan.Load(); !force && last != 0 && t-last < int64(c.RescanInterval) {
 		return
 	}
 	if force {
@@ -190,7 +194,6 @@ func (b *lb) rescan(force bool) {
 		return
 	}
 	defer b.scanMu.Unlock()
-	c := b.shared.Load().config()
 	view := *b.view.Load()
 	best := int64(math.MaxInt64)
 	for _, e := range view {
@@ -201,8 +204,17 @@ func (b *lb) rescan(force bool) {
 	if best == math.MaxInt64 {
 		return
 	}
-	ref := max(best, int64(c.MinLatencyFloor))
-	b.min.Store(ref)
-	b.nextScan.Store(t + int64(c.RescanInterval))
-	b.recordScan(view, c, ref)
+	b.min.Store(best)
+	b.lastScan.Store(t)
+	b.recordScan(view, c, b.ref(c))
+}
+
+// ref is the reference members are judged against: the cluster minimum,
+// clamped to the floor when read so a new floor applies at once; 0 until a
+// member qualifies.
+func (b *lb) ref(c *Config) int64 {
+	if m := b.min.Load(); m > 0 {
+		return max(m, int64(c.MinLatencyFloor))
+	}
+	return 0
 }

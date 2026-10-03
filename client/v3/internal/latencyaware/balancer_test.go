@@ -176,12 +176,30 @@ func TestTheClusterMinimum(t *testing.T) {
 	assert.Equalf(t, int64(6*ms), h.b.min.Load(), "at most once per rescan interval")
 	h.clk.advance(2 * time.Second)
 	h.b.rescan(false)
-	assert.Equalf(t, int64(ms), h.b.min.Load(), "clamped up to the floor")
+	assert.Equal(t, int64(ms/2), h.b.min.Load())
+	assert.Equalf(t, int64(ms), h.b.ref(h.sh.config()), "clamped up to the floor when read")
 
 	h.warm(c, 3*ms, 2*time.Hour)
 	h.clk.advance(2 * time.Second)
 	h.b.rescan(false)
-	assert.Equalf(t, int64(ms), h.b.min.Load(), "nothing qualifying keeps the last value")
+	assert.Equalf(t, int64(ms/2), h.b.min.Load(), "nothing qualifying keeps the last value")
+}
+
+func TestANewRescanIntervalAppliesAtOnce(t *testing.T) {
+	h := newHarness(t, pickerConfig())
+	h.resolve("a")
+	a := h.member("a")
+	h.warm(a, 6*ms, 0)
+	h.b.rescan(false)
+	require.Equal(t, int64(6*ms), h.b.min.Load())
+
+	cfg := pickerConfig()
+	cfg.RescanInterval = 100 * ms
+	require.NoError(t, h.sh.Set(cfg))
+	h.clk.advance(200 * ms)
+	h.warm(a, 3*ms, 0)
+	h.b.rescan(false)
+	assert.Equalf(t, int64(3*ms), h.b.min.Load(), "200ms is past the new 100ms interval, though not the old 2s")
 }
 
 func TestAScanInFlightIsNotDuplicated(t *testing.T) {

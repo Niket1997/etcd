@@ -35,8 +35,8 @@ const strikesToCount = 3
 
 // endpoint is one member's latency state. It lives on the balancer, so it
 // survives picker rebuilds, and goes when the member leaves the resolver state.
-// Readers load the atomics without locking; a reader may briefly see a new
-// sample count with the previous average, which no verdict depends on.
+// Readers load the atomics without locking, so they may mix fields of adjacent
+// samples; that leaves a verdict or the cluster minimum one sample behind.
 type endpoint struct {
 	addr string
 	lbl  labels
@@ -45,8 +45,8 @@ type endpoint struct {
 	avg  atomic.Int64 // ns: running mean while warming up, then the EMA
 	last atomic.Int64 // clock time of the last sample
 
-	probeNext atomic.Int64 // no probe may be claimed until after this clock time
-	refused   atomic.Bool  // the last verdict seen, so only changes are logged
+	probeAt atomic.Int64 // clock time of the last probe claimed, 0 for none
+	refused atomic.Bool  // the last verdict seen, so only changes are logged
 
 	mu         sync.Mutex // serialises samples and strikes
 	strikeFrom int64
@@ -122,14 +122,23 @@ func (e *endpoint) refusedBy(c *Config, ref int64) bool {
 }
 
 // claimProbe lets one pick per RetryPeriod through to a refused member whose
-// last sample is older than that. Concurrent callers agree on one winner.
+// last sample is older than that. Concurrent callers agree on one winner. It
+// keeps the claim's time, not a deadline, so a new RetryPeriod applies at once.
 func (e *endpoint) claimProbe(t, retry int64) bool {
-	next := e.probeNext.Load()
-	return t-e.last.Load() > retry && t > next && e.probeNext.CompareAndSwap(next, t+retry)
+	at := e.probeAt.Load()
+	return t-e.last.Load() > retry && (at == 0 || t-at > retry) && e.probeAt.CompareAndSwap(at, t)
 }
 
-// synthetic is the sample a counted failure records. The cap keeps the float
-// conversion defined; real latencies are nowhere near it.
+// releaseProbe hands back the claim made at t (0: none, a no-op) when its pick
+// sent nothing, unless a newer claim replaced it. The claim before t was over
+// a retry period old, so clearing it to none changes nothing else.
+func (e *endpoint) releaseProbe(t int64) { e.probeAt.CompareAndSwap(t, 0) }
+
+// maxSample caps a synthetic sample, whatever the config, so the EMA's float
+// conversions stay defined; real latencies are nowhere near it.
+const maxSample = 1e18
+
+// synthetic is the sample a counted failure records.
 func synthetic(c *Config, ref int64) int64 {
-	return max(int64(c.MinSyntheticLatency), int64(math.Min(c.SyntheticMultiplier*float64(ref), 1e18)))
+	return min(max(int64(c.MinSyntheticLatency), int64(math.Min(c.SyntheticMultiplier*float64(ref), maxSample))), maxSample)
 }

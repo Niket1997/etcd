@@ -59,7 +59,7 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 		return p.ready[rr].picker.Pick(info)
 	}
 
-	ref := p.b.min.Load()
+	ref := p.b.ref(c)
 	var buf [8]bool
 	refused, k := buf[:0], 0
 	for _, m := range p.ready {
@@ -75,9 +75,9 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	p.b.noteFallback(guard, c, k, missing, len(p.ready), p.total)
 
 	tm := timed(info.FullMethodName)
-	chosen, out := rr, outcomeQuorum
+	chosen, out, probeAt := rr, outcomeQuorum, int64(0)
 	if !guard {
-		chosen, out = p.choose(cur, rr, refused, k, c, c.Mode == ModeEnabled && tm)
+		chosen, out, probeAt = p.choose(cur, rr, refused, k, c, c.Mode == ModeEnabled && tm)
 	}
 	if refused[rr] && chosen != rr {
 		p.b.countPick(p.ready[rr].ep, outcomeRefused)
@@ -86,26 +86,26 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	if c.Mode == ModeShadow {
 		chosen = rr
 	}
-	return p.pick(info, p.ready[chosen], tm, out == outcomeProbe)
+	return p.pick(info, p.ready[chosen], tm, probeAt)
 }
 
 // choose applies the verdicts to one pick: a due probe first, then an even
 // split over the admitted members, then the member at the cursor if every
-// member is refused.
-func (p *picker) choose(cur uint32, rr int, refused []bool, k int, c *Config, probes bool) (int, outcome) {
+// member is refused. A probe also returns the time it was claimed at, else 0.
+func (p *picker) choose(cur uint32, rr int, refused []bool, k int, c *Config, probes bool) (int, outcome, int64) {
 	if k == 0 {
-		return rr, outcomeAllowed
+		return rr, outcomeAllowed, 0
 	}
 	if probes {
 		t := p.b.now()
 		for i := range refused {
 			if j := (rr + i) % len(refused); refused[j] && p.ready[j].ep.claimProbe(t, int64(c.RetryPeriod)) {
-				return j, outcomeProbe
+				return j, outcomeProbe, t
 			}
 		}
 	}
 	if k == len(refused) {
-		return rr, outcomeFallback
+		return rr, outcomeFallback, 0
 	}
 	// The (cur mod admitted)-th admitted member. Moving on to the next member
 	// instead would hand a refused member's share to its neighbour alone.
@@ -115,23 +115,28 @@ func (p *picker) choose(cur uint32, rr int, refused []bool, k int, c *Config, pr
 			want--
 		}
 	}
-	return j, outcomeAllowed
+	return j, outcomeAllowed, 0
 }
 
-// pick asks the member's child for a SubConn and learns from how the call ends.
-func (p *picker) pick(info balancer.PickInfo, m member, tm, probe bool) (balancer.PickResult, error) {
+// pick asks the member's child for a SubConn and learns from how the call
+// ends. A probe claimed at probeAt (0 for none) is handed back if no call goes
+// out, so the next timed pick can take it.
+func (p *picker) pick(info balancer.PickInfo, m member, tm bool, probeAt int64) (balancer.PickResult, error) {
 	res, err := m.picker.Pick(info)
 	if err != nil {
+		m.ep.releaseProbe(probeAt)
 		return res, err
 	}
-	b, start, done := p.b, p.b.now(), res.Done
+	b, e, start, done := p.b, m.ep, p.b.now(), res.Done
 	res.Done = func(di balancer.DoneInfo) {
 		if done != nil {
 			done(di)
 		}
 		// A zero DoneInfo is a pick gRPC abandoned before the call went out.
 		if di.Err != nil || di.BytesSent || di.BytesReceived {
-			b.finish(m.ep, di.Err, start, tm, probe)
+			b.finish(e, di.Err, start, tm, probeAt != 0)
+		} else {
+			e.releaseProbe(probeAt)
 		}
 	}
 	return res, nil

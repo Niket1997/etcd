@@ -187,8 +187,8 @@ func (c *Client) SetEndpoints(eps ...string) {
 }
 
 // SetLatencyAwareConfig changes the latency-aware config of a client created
-// with one. The next request uses it, without reconnecting; a bad config
-// changes nothing.
+// with one. Decisions use it from the next request, without reconnecting, and
+// keep what the policy has learned; a bad config changes nothing.
 func (c *Client) SetLatencyAwareConfig(cfg LatencyAwareConfig) error {
 	if c.latencyAware == nil {
 		return ErrNoLatencyAware

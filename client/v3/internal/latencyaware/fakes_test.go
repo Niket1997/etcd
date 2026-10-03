@@ -17,6 +17,7 @@ package latencyaware
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,6 +89,31 @@ func (h *harness) member(addr string) *endpoint {
 	e, ok := h.b.eps.Get(endpointOf(addr))
 	require.Truef(h.t, ok, "no member %s", addr)
 	return e
+}
+
+// logged waits until the queued transition lines are written and returns them.
+func (h *harness) logged() *observer.ObservedLogs {
+	h.t.Helper()
+	require.Eventually(h.t, func() bool {
+		h.b.logMu.Lock()
+		defer h.b.logMu.Unlock()
+		return !h.b.logging
+	}, 10*time.Second, time.Millisecond)
+	return h.logs
+}
+
+// stuckSink is a log sink whose writes wait until release is closed.
+type stuckSink struct {
+	release chan struct{}
+	entered atomic.Bool
+	lines   atomic.Int32
+}
+
+func (s *stuckSink) Write(p []byte) (int, error) {
+	s.entered.Store(true)
+	<-s.release
+	s.lines.Add(1)
+	return len(p), nil
 }
 
 func endpointOf(addr string) resolver.Endpoint {

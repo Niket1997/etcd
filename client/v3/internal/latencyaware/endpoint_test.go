@@ -215,6 +215,17 @@ func TestTheSyntheticSample(t *testing.T) {
 	c.MinSyntheticLatency = time.Millisecond
 	assert.Equalf(t, int64(time.Second), synthetic(c, int64(50*time.Millisecond)), "20 × 50ms")
 	assert.Equalf(t, int64(1e18), synthetic(c, math.MaxInt64/2), "capped, never wrapped")
+	c.MinSyntheticLatency = math.MaxInt64
+	assert.Equalf(t, int64(1e18), synthetic(c, 0), "capped whatever the config")
+}
+
+func TestAnAbsurdSyntheticFloorNeverOverflowsTheAverage(t *testing.T) {
+	clk, c, e := newFakeClock(), testConfig(t), &endpoint{}
+	c.WarmupSamples, c.MinSyntheticLatency = 1, math.MaxInt64
+	e.transportFailure(clk.now, c, 0)
+	clk.advance(time.Second)
+	e.transportFailure(clk.now, c, 0)
+	assert.InDelta(t, 1e18, float64(e.avg.Load()), 1e3)
 }
 
 func TestOneProbePerRetryPeriod(t *testing.T) {
@@ -262,4 +273,31 @@ func TestEverySampleLandsUnderContention(t *testing.T) {
 	}
 	wg.Wait()
 	assert.EqualValues(t, 64000, e.n.Load())
+}
+
+func TestANewRetryPeriodAppliesToAClaimedProbe(t *testing.T) {
+	clk, e := newFakeClock(), &endpoint{}
+	pin(e, 3, time.Second, 0)
+	require.True(t, e.claimProbe(clk.now(), int64(30*time.Minute)))
+	clk.advance(2 * time.Second)
+	assert.Truef(t, e.claimProbe(clk.now(), int64(time.Second)), "the claim is 2s old, past the new 1s period")
+}
+
+func TestAProbeHandedBackIsFreeAgain(t *testing.T) {
+	clk, e := newFakeClock(), &endpoint{}
+	retry := int64(time.Minute)
+	pin(e, 3, time.Second, 0)
+
+	t1 := clk.now()
+	require.True(t, e.claimProbe(t1, retry))
+	e.releaseProbe(t1)
+	require.Truef(t, e.claimProbe(t1, retry), "handed back")
+
+	clk.advance(time.Minute + 1)
+	t2 := clk.now()
+	require.True(t, e.claimProbe(t2, retry))
+	e.releaseProbe(t1)
+	assert.Falsef(t, e.claimProbe(t2, retry), "a stale hand-back leaves the newer claim")
+	e.releaseProbe(0)
+	assert.Falsef(t, e.claimProbe(t2, retry), "no claim, nothing handed back")
 }

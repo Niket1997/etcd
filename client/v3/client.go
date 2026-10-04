@@ -38,6 +38,7 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/verify"
 	"go.etcd.io/etcd/client/v3/credentials"
 	"go.etcd.io/etcd/client/v3/internal/endpoint"
+	"go.etcd.io/etcd/client/v3/internal/latencyaware"
 	"go.etcd.io/etcd/client/v3/internal/resolver"
 )
 
@@ -45,6 +46,7 @@ var (
 	ErrNoAvailableEndpoints = errors.New("etcdclient: no available endpoints")
 	ErrOldCluster           = errors.New("etcdclient: old cluster version")
 	ErrMutuallyExclusiveCfg = errors.New("Username/Password and Token configurations are mutually exclusive")
+	ErrNoLatencyAware       = errors.New("etcdclient: client was created without a latency-aware config")
 )
 
 // Client provides and manages an etcd v3 client session.
@@ -80,6 +82,8 @@ type Client struct {
 	callOpts []grpc.CallOption
 
 	lg atomic.Pointer[zap.Logger]
+
+	latencyAware *latencyaware.Shared // nil without Config.LatencyAware
 }
 
 // New creates a new etcdv3 client from a given configuration.
@@ -180,6 +184,16 @@ func (c *Client) SetEndpoints(eps ...string) {
 	c.endpoints = eps
 
 	c.resolver.SetEndpoints(eps)
+}
+
+// SetLatencyAwareConfig changes the latency-aware config of a client created
+// with one. Decisions use it from the next request, without reconnecting, and
+// keep what the policy has learned; a bad config changes nothing.
+func (c *Client) SetLatencyAwareConfig(cfg LatencyAwareConfig) error {
+	if c.latencyAware == nil {
+		return ErrNoLatencyAware
+	}
+	return c.latencyAware.Set(cfg)
 }
 
 // Sync synchronizes client's endpoints with the known endpoints from the etcd membership.
@@ -406,6 +420,13 @@ func newClient(cfg *Config) (*Client, error) {
 	}
 	client.lg.Store(lg)
 
+	if cfg.LatencyAware != nil {
+		if client.latencyAware, err = latencyaware.NewShared(*cfg.LatencyAware, lg); err != nil {
+			client.cancel()
+			return nil, err
+		}
+	}
+
 	if cfg.Username != "" && cfg.Password != "" {
 		client.Username = cfg.Username
 		client.Password = cfg.Password
@@ -435,7 +456,11 @@ func newClient(cfg *Config) (*Client, error) {
 		client.callOpts = callOpts
 	}
 
-	client.resolver = resolver.New(cfg.Endpoints...)
+	if client.latencyAware != nil {
+		client.resolver = resolver.NewWithPolicy(latencyaware.ServiceConfig, client.latencyAware.Attributes(), cfg.Endpoints...)
+	} else {
+		client.resolver = resolver.New(cfg.Endpoints...)
+	}
 
 	if len(cfg.Endpoints) < 1 {
 		client.cancel()
